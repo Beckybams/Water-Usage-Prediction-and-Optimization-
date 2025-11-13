@@ -1,0 +1,265 @@
+# Water-Usage-Prediction-and-Optimization
+# Single-file script that:
+# 1. Generates synthetic hourly water-usage data for multiple households/devices
+# 2. Trains a regression model to predict water usage
+# 3. Evaluates model performance
+# 4. Demonstrates a simple optimization to meet a reduction target by shifting/reducing usage
+#
+# Requirements (standard data science stack):
+# - Python 3.8+
+# - numpy, pandas, scikit-learn, matplotlib, scipy (scipy optional; fallback implemented)
+#
+# Run: python Water-Usage-Prediction-and-Optimization.py
+
+import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import matplotlib.pyplot as plt
+import joblib
+
+try:
+    from scipy.optimize import linprog
+    SCIPY_AVAILABLE = True
+except Exception:
+    SCIPY_AVAILABLE = False
+
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+
+# -----------------------------
+# 1) Synthetic data generator
+# -----------------------------
+
+def generate_synthetic_water_usage(n_households=50, days=90, freq='H'):
+    """
+    Generate synthetic hourly water usage data for n_households over 'days' days.
+    Each household has a base demand curve + variability affected by temperature, rainfall, day-of-week, occupancy.
+    Returns a DataFrame with columns: ['household_id', 'timestamp', 'usage_liters', 'temp_c', 'rain_mm', 'occupancy', 'is_weekend']
+    """
+    start = datetime.now().replace(minute=0, second=0, microsecond=0) - timedelta(days=days)
+    periods = int(days * 24)
+    timestamps = [start + timedelta(hours=i) for i in range(periods)]
+
+    rows = []
+    for h in range(n_households):
+        # household-specific baseline and behavior
+        baseline = np.random.uniform(20, 120)  # liters per hour average baseline
+        morning_peak = np.random.uniform(1.5, 3.5)  # multiplier
+        evening_peak = np.random.uniform(1.5, 3.0)
+        weekend_factor = np.random.uniform(1.05, 1.4)
+        occupancy = np.random.choice([1,2,3,4], p=[0.15,0.35,0.3,0.2])
+
+        for i, ts in enumerate(timestamps):
+            hour = ts.hour
+            dow = ts.weekday()
+            is_weekend = 1 if dow >= 5 else 0
+
+            # Temperature seasonal component (sinusoidal daily + random noise)
+            day_of_year = ts.timetuple().tm_yday
+            temp_daily = 10 + 10*np.sin(2*np.pi*(day_of_year/365.0)) + np.random.normal(0,2)
+
+            # Rainfall as sparse events
+            rain = max(0.0, np.random.exponential(scale=0.2) - 0.15) if np.random.rand() < 0.05 else 0.0
+
+            # Hour-of-day pattern
+            if 5 <= hour <= 8:
+                tod_multiplier = morning_peak
+            elif 17 <= hour <= 20:
+                tod_multiplier = evening_peak
+            elif 10 <= hour <= 16:
+                tod_multiplier = 0.9
+            else:
+                tod_multiplier = 0.6
+
+            # Influence of temperature and rain (hotter -> more outdoor / garden use; rain -> less)
+            temp_effect = 1 + max(0, (temp_daily - 20) * 0.02)
+            rain_effect = 0.7 if rain > 0.5 else 1.0
+
+            # Occasional leaks or events
+            leak = 0
+            if np.random.rand() < 0.001:
+                # leak persists for a while
+                leak = np.random.uniform(50, 300)
+
+            # Compose usage
+            usage = baseline * tod_multiplier * occupancy * temp_effect * rain_effect
+            # add noise and leak
+            usage += np.random.normal(0, baseline*0.1) + leak
+            # ensure non-negative
+            usage = max(0.0, usage)
+
+            rows.append({
+                'household_id': f'H_{h:03d}',
+                'timestamp': ts,
+                'hour': hour,
+                'day_of_week': dow,
+                'is_weekend': is_weekend,
+                'temp_c': round(temp_daily + np.random.normal(0,1),2),
+                'rain_mm': round(rain + np.random.normal(0,0.05),3) if rain>0 else 0.0,
+                'occupancy': occupancy,
+                'usage_liters': round(usage, 3)
+            })
+
+    df = pd.DataFrame(rows)
+    # Add rolling leak signals: artificially create some longer leaks for some households
+    for _ in range(int(n_households * 0.05)):
+        hh = np.random.choice(df['household_id'].unique())
+        start_idx = np.random.randint(0, len(timestamps)-48)
+        end_idx = start_idx + np.random.randint(24, 72)
+        mask = (df['household_id'] == hh) & (df['timestamp'].between(timestamps[start_idx], timestamps[end_idx]))
+        df.loc[mask, 'usage_liters'] += np.random.uniform(20,80)
+
+    df.sort_values(['household_id','timestamp'], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+# -----------------------------
+# 2) Create dataset and features
+# -----------------------------
+
+df = generate_synthetic_water_usage(n_households=30, days=60)
+print('Generated rows:', len(df))
+
+# Feature engineering: add lag features and rolling stats per household
+
+df['timestamp'] = pd.to_datetime(df['timestamp'])
+df.set_index('timestamp', inplace=True)
+
+feat_frames = []
+for hh, group in df.groupby('household_id'):
+    g = group.copy()
+    # lags (1h, 24h)
+    g['lag_1'] = g['usage_liters'].shift(1).fillna(method='bfill')
+    g['lag_24'] = g['usage_liters'].shift(24).fillna(method='bfill')
+    # rolling mean
+    g['roll_24_mean'] = g['usage_liters'].rolling(window=24, min_periods=1).mean()
+    g['roll_72_mean'] = g['usage_liters'].rolling(window=72, min_periods=1).mean()
+    # hour sin/cos to capture cyclical nature
+    g['hour_sin'] = np.sin(2*np.pi*g['hour']/24)
+    g['hour_cos'] = np.cos(2*np.pi*g['hour']/24)
+    feat_frames.append(g)
+
+feat_df = pd.concat(feat_frames)
+feat_df.reset_index(inplace=True)
+
+# Target: predict next hour's usage
+feat_df['target_next_hour'] = feat_df.groupby('household_id')['usage_liters'].shift(-1)
+feat_df.dropna(inplace=True)
+
+# Select features and split
+features = ['household_id','hour','day_of_week','is_weekend','temp_c','rain_mm','occupancy',
+            'lag_1','lag_24','roll_24_mean','roll_72_mean','hour_sin','hour_cos']
+
+# Simple encoding for household id: map to integer
+hh_map = {hh:i for i,hh in enumerate(sorted(feat_df['household_id'].unique()))}
+feat_df['household_idx'] = feat_df['household_id'].map(hh_map)
+features_for_model = ['household_idx','hour','day_of_week','is_weekend','temp_c','rain_mm','occupancy',
+                      'lag_1','lag_24','roll_24_mean','roll_72_mean','hour_sin','hour_cos']
+
+X = feat_df[features_for_model].values
+y = feat_df['target_next_hour'].values
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=RANDOM_SEED)
+
+# -----------------------------
+# 3) Train a model
+# -----------------------------
+
+model = GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, max_depth=6, random_state=RANDOM_SEED)
+print('Training model...')
+model.fit(X_train, y_train)
+print('Training complete')
+
+# -----------------------------
+# 4) Evaluate
+# -----------------------------
+
+y_pred = model.predict(X_test)
+mae = mean_absolute_error(y_test, y_pred)
+rmse = mean_squared_error(y_test, y_pred, squared=False)
+
+print(f'MAE: {mae:.3f} liters')
+print(f'RMSE: {rmse:.3f} liters')
+
+# Feature importance
+importances = model.feature_importances_
+for f, imp in zip(features_for_model, importances):
+    print(f'{f:15s}: {imp:.4f}')
+
+# Plot a small sample of predictions vs true for visual check
+sample_idx = np.random.choice(range(len(y_test)), size=200, replace=False)
+plt.figure(figsize=(10,4))
+plt.plot(y_test[sample_idx], label='true', linewidth=1)
+plt.plot(y_pred[sample_idx], label='pred', linewidth=1)
+plt.legend()
+plt.title('Sample: True vs Predicted Next-hour Usage (liters)')
+plt.tight_layout()
+plt.show()
+
+# -----------------------------
+# 5) Simple optimization example
+# -----------------------------
+# Problem: Given a household's predicted hourly usage for the next 24 hours, meet a target total reduction
+# by shifting/reducing usage across hours. Each hour i has a cost of reduction (discomfort) proportional to
+# predicted usage and a time-preference factor (higher cost during peak hours). We'll minimize total cost
+# subject to sum(reduction) >= target_reduction and 0 <= reduction_i <= max_reducible_i
+
+
+def optimize_reduction(predicted_usage, target_reduction, max_fraction_per_hour=0.5, peak_hours=None):
+    """
+    predicted_usage: array-like of length H (e.g., 24)
+    target_reduction: absolute liters to reduce across the horizon
+    Returns reductions per hour (same shape as predicted_usage)
+    """
+    H = len(predicted_usage)
+    predicted_usage = np.array(predicted_usage)
+
+    # max reducible per hour
+    max_reducible = max_fraction_per_hour * predicted_usage
+
+    # cost per liter reduced for each hour. We'll make peak hours more costly to reduce.
+    if peak_hours is None:
+        peak_hours = [(6,9),(17,20)]  # morning and evening
+
+    cost = np.ones(H)
+    for (s,e) in peak_hours:
+        for h in range(s, e+1):
+            cost[h % H] *= 1.5
+    # also weight by predicted usage to reflect inconvenience when usage is important
+    cost = cost * (1 + predicted_usage / (predicted_usage.mean()+1e-6))
+
+    # If scipy is available, use linear programming: minimize c^T x subject to A_ub x <= b_ub, A_eq x >= target
+    if SCIPY_AVAILABLE:
+        # minimize cost^T reductions
+        c = cost
+        # bounds for each variable (0, max_reducible)
+        bounds = [(0, float(max_reducible[i])) for i in range(H)]
+        # constraint: sum(reductions) >= target_reduction  ->  -sum(x) <= -target
+        A_ub = np.ones((1,H)) * -1.0
+        b_ub = np.array([-target_reduction])
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+        if res.success:
+            return res.x
+        else:
+            # fallback to greedy
+            pass
+
+    # Fallback greedy allocation: reduce where cost per liter is smallest first
+    remaining = target_reduction
+    reductions = np.zeros(H)
+    # sort hours by cost ascending
+    order = np.argsort(cost)
+    for idx in order:
+        take = min(max_reducible[idx], remaining)
+        reductions[idx] = take
+        remaining -= take
+        if remaining <= 1e-6:
+            break
+    if remaining > 1e-6:
+        print('Warning: target reduction not fully achievable; short by', remaining, 'liters')
+    return reductions
+
+# Demonstration for one household for next
